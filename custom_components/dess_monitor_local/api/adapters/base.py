@@ -48,7 +48,7 @@ class BaseAdapter(ABC):
         return await self.set_data(f"PBRV{voltage}")
 
     async def set_max_combined_charge_current(self, amps: int) -> dict:
-        return await self.set_data(f"MCHGC{amps:03d}")
+        return await self.set_data(f"MNCHGC{amps:03d}")
 
     async def set_battery_charge_current(self, amps: int) -> dict:
         return await self.set_data(f"PBATC{amps:03d}")

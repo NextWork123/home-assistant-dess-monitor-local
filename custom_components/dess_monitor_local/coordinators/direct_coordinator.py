@@ -55,7 +55,7 @@ class DirectCoordinator(DataUpdateCoordinator):
         ("QPIGS2", "qpigs2", 2),  # 2nd MPPT (often NAK'd)
         ("QPIWS", "qpiws", 3),    # warnings/faults (PI30)
         ("QFWS", "qfws", 3),      # warnings/faults (PI18)
-        ("QPIRI", "qpiri", 12),   # ratings/nameplate — essentially static
+        ("QPIRI", "qpiri", 6),    # ratings + editable settings — confirm changes faster
     )
     # Per-device poll bound, applied ONLY with multiple devices (an EyBond hub
     # with several children). One stuck/half-attentive dongle answering FC=4
@@ -159,6 +159,38 @@ class DirectCoordinator(DataUpdateCoordinator):
         protocol = self.config_entry.options.get(CONF_PROTOCOL, PROTOCOL_VOLTRONIC)
         name = self.config_entry.data.get(CONF_NAME) or "Inverter"
         return [DeviceTarget(id=device, uri=device, protocol=protocol, name=name)]
+
+    async def async_refresh_command(self, key: str, cmd: str, section: str) -> None:
+        """Force-read one command for one device NOW and publish it.
+
+        Used right after a write (set) so the affected section (e.g. QPIRI
+        for a priority/current change) is confirmed immediately instead of
+        waiting for its scheduled cadence — which is what made settings
+        appear to "revert" in the UI.
+        """
+        uri = next((t.uri for t in self.devices if t.id == key), None)
+        if uri is None:
+            return
+        strict_crc = bool(
+            self.config_entry.options.get(CONF_STRICT_CRC, DEFAULT_STRICT_CRC)
+        )
+        queue = self.hass.data["dess_monitor_local_queue"]
+        try:
+            if uri.startswith("eybond"):
+                result = await get_direct_data(uri, cmd, 30, strict_crc=strict_crc)
+            else:
+                result = await queue.enqueue(
+                    lambda: get_direct_data(uri, cmd, 30, strict_crc=strict_crc)
+                )
+        except Exception:
+            result = None
+        if not result:
+            return
+        data = dict(self.data or {})
+        dev = dict(data.get(key) or {})
+        dev[section] = result
+        data[key] = dev
+        self.async_set_updated_data(data)
 
     async def _async_update_data(self):
         strict_crc = bool(

@@ -1,3 +1,7 @@
+import asyncio
+import logging
+import time
+
 from homeassistant.components.select import SelectEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
@@ -18,6 +22,8 @@ from custom_components.dess_monitor_local.api.commands.direct_commands import (
 from custom_components.dess_monitor_local.const import DOMAIN
 from custom_components.dess_monitor_local.coordinators.direct_coordinator import DirectCoordinator
 from custom_components.dess_monitor_local.hub import InverterDevice
+
+_LOGGER = logging.getLogger(__name__)
 
 BATTERY_MODE_LI_VOLTAGE = "Lithium (Voltage)"
 BATTERY_MODE_LI_BMS = "Lithium (BMS)"
@@ -95,6 +101,20 @@ class BatteryModeSelect(SelectEntity, RestoreEntity):
 class SelectBase(CoordinatorEntity, SelectEntity):
     # should_poll = True
 
+    # While a write is in flight, the chosen value is held so an
+    # interleaving scheduled poll (which may carry forward a stale QPIRI
+    # section) can't revert the dropdown before the change is confirmed.
+    _pending_option: str | None = None
+    _pending_since: float = 0.0
+    # Hold window must exceed the QPIRI poll interval (~120s at the default
+    # 10s cadence*12) so a natural read can confirm the change before any
+    # revert; otherwise the value flips back to stale carried-forward data.
+    _PENDING_TTL: float = 150.0
+    # After an ACK, re-read fresh QPIRI a few times to catch inverter commit
+    # lag / a transient CRC/timeout on the first read.
+    _CONFIRM_ATTEMPTS: int = 4
+    _CONFIRM_DELAY: float = 1.0
+
     def __init__(self, inverter_device: InverterDevice, coordinator: DirectCoordinator):
         """Initialize the sensor."""
         super().__init__(coordinator)
@@ -130,15 +150,73 @@ class SelectBase(CoordinatorEntity, SelectEntity):
             self._inverter_device.inverter_id
         ) or {}
 
-    # async def async_added_to_hass(self):
-    #     """Run when this Entity has been added to HA."""
-    #     # Sensors should also register callbacks to HA when their state changes
-    #     self._inverter_device.register_callback(self.async_write_ha_state)
-    #
-    # async def async_will_remove_from_hass(self):
-    #     """Entity being removed from hass."""
-    #     # The opposite of async_added_to_hass. Remove any registered call backs here.
-    #     self._inverter_device.remove_callback(self.async_write_ha_state)
+    def _read_current(self, data) -> str | None:
+        """Return the option reflected by ``data`` (subclasses override)."""
+        raise NotImplementedError
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        current = self._read_current(self.data)
+        if self._pending_option is not None:
+            confirmed = current == self._pending_option
+            expired = (time.monotonic() - self._pending_since) > self._PENDING_TTL
+            if confirmed or expired:
+                self._pending_option = None
+                self._attr_current_option = current
+            else:
+                # Hold the user's choice until the device confirms it.
+                self._attr_current_option = self._pending_option
+        else:
+            self._attr_current_option = current
+        self.async_write_ha_state()
+
+    @staticmethod
+    def _is_ack(result) -> bool:
+        """True if an inverter set-response indicates acceptance.
+
+        Handles both transports: TCP returns ``{"status": "ACK"}`` while the
+        serial path decodes to ``{"Raw": "ACK9..."}``.
+        """
+        if not isinstance(result, dict):
+            return False
+        if result.get("status") == "ACK":
+            return True
+        if result.get("status") == "NAK" or "error" in result:
+            return False
+        return any(
+            isinstance(v, str) and "ACK" in v and "NAK" not in v
+            for v in result.values()
+        )
+
+    async def _set_and_confirm(
+        self, send_fn, option: str, section: str = "qpiri", cmd: str = "QPIRI"
+    ) -> None:
+        """Optimistically apply ``option``, retry the write until ACK, then
+        force an immediate targeted re-read so the value is confirmed
+        instead of reverting on the next scheduled poll."""
+        self._pending_option = option
+        self._pending_since = time.monotonic()
+        self._attr_current_option = option
+        self.async_write_ha_state()
+        queue = self.hass.data["dess_monitor_local_queue"]
+        acked = False
+        for _ in range(3):
+            if self._is_ack(await queue.enqueue(send_fn)):
+                acked = True
+                break
+            await asyncio.sleep(0.5)
+        if not acked:
+            _LOGGER.warning("%s: set not ACKed after retries", self._attr_name)
+        # Re-read fresh QPIRI until it reflects the new value. Each refresh
+        # publishes and drives _handle_coordinator_update, which clears
+        # _pending_option once the readback confirms the change.
+        for _ in range(self._CONFIRM_ATTEMPTS):
+            await asyncio.sleep(self._CONFIRM_DELAY)
+            await self.coordinator.async_refresh_command(
+                self._inverter_device.inverter_id, cmd, section
+            )
+            if self._pending_option is None:
+                return
 
 
 def resolve_output_priority(device_data):
@@ -176,10 +254,7 @@ class InverterOutputPrioritySelect(SelectBase):
             self._attr_current_option = output_source_priority
             # self._attr_current_option = resolve_output_priority(data, device_data)
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        data = self.data
-        # device_data = self._inverter_device.device_data
+    def _read_current(self, data) -> str | None:
         mapper = {
             'UtilityFirst': 'UtilityFirst',
             'SBU': 'SBU',
@@ -187,22 +262,22 @@ class InverterOutputPrioritySelect(SelectBase):
             'SolarFirst': 'Solar',
         }
         priority = resolve_output_priority(data)
-        mapped_priority = mapper.get(priority, priority)
-        self._attr_current_option = mapped_priority
-        self.async_write_ha_state()
+        return mapper.get(priority, priority)
 
     async def async_select_option(self, option: str):
-        if option in self._attr_options:
-            map_priority = {
-                'UtilityFirst': OutputSourcePrioritySetting.UTILITY_FIRST,
-                'SBU': OutputSourcePrioritySetting.SBU_PRIORITY,
-                'Solar': OutputSourcePrioritySetting.SOLAR_FIRST,
-            }
-            queue = self.hass.data["dess_monitor_local_queue"]
-            await queue.enqueue(
-                lambda: set_output_source_priority(self._inverter_device.device_data, map_priority[option]))
-            self._attr_current_option = option
-        await self.coordinator.async_request_refresh()
+        if option not in self._attr_options:
+            return
+        map_priority = {
+            'UtilityFirst': OutputSourcePrioritySetting.UTILITY_FIRST,
+            'SBU': OutputSourcePrioritySetting.SBU_PRIORITY,
+            'Solar': OutputSourcePrioritySetting.SOLAR_FIRST,
+        }
+        await self._set_and_confirm(
+            lambda: set_output_source_priority(
+                self._inverter_device.device_data, map_priority[option]
+            ),
+            option,
+        )
 
 
 class InverterChargeSourcePrioritySelect(SelectBase):
@@ -218,24 +293,23 @@ class InverterChargeSourcePrioritySelect(SelectBase):
             data = coordinator.data.get(self._inverter_device.inverter_id) or {}
             self._attr_current_option = resolve_chrage_source_priority(data)
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        data = self.data
-        self._attr_current_option = resolve_chrage_source_priority(data)
-        self.async_write_ha_state()
+    def _read_current(self, data) -> str | None:
+        return resolve_chrage_source_priority(data)
 
     async def async_select_option(self, option: str):
-        if option in self._attr_options:
-            map_priority = {
-                'UtilityFirst': ChargeSourcePrioritySetting.UTILITY_FIRST,
-                'SolarFirst': ChargeSourcePrioritySetting.SOLAR_FIRST,
-                'SolarAndUtility': ChargeSourcePrioritySetting.SOLAR_AND_UTILITY,
-            }
-            queue = self.hass.data["dess_monitor_local_queue"]
-            await queue.enqueue(
-                lambda: set_charge_source_priority(self._inverter_device.device_data, map_priority[option]))
-            self._attr_current_option = option
-        await self.coordinator.async_request_refresh()
+        if option not in self._attr_options:
+            return
+        map_priority = {
+            'UtilityFirst': ChargeSourcePrioritySetting.UTILITY_FIRST,
+            'SolarFirst': ChargeSourcePrioritySetting.SOLAR_FIRST,
+            'SolarAndUtility': ChargeSourcePrioritySetting.SOLAR_AND_UTILITY,
+        }
+        await self._set_and_confirm(
+            lambda: set_charge_source_priority(
+                self._inverter_device.device_data, map_priority[option]
+            ),
+            option,
+        )
 
 
 def _normalize_amps(raw) -> str | None:
@@ -262,26 +336,22 @@ class InverterMaxUtilityChargingCurrentNumber(SelectBase):
             self._raw_readback = raw if raw is None else str(raw)
             self._attr_current_option = _normalize_amps(raw)
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        data = self.data
+    def _read_current(self, data) -> str | None:
         raw = resolve_max_utility_charging_current(data)
         self._raw_readback = raw if raw is None else str(raw)
-        self._attr_current_option = _normalize_amps(raw)
-        self.async_write_ha_state()
+        return _normalize_amps(raw)
 
     async def async_select_option(self, option: str):
-        if option in self._attr_options:
-            amps = int(option)
-            float_format = self._raw_readback is not None and '.' in self._raw_readback
-            queue = self.hass.data["dess_monitor_local_queue"]
-            await queue.enqueue(
-                lambda: set_max_utility_charge_current(
-                    self._inverter_device.device_data, amps, float_format=float_format
-                )
-            )
-            self._attr_current_option = option
-        await self.coordinator.async_request_refresh()
+        if option not in self._attr_options:
+            return
+        amps = int(option)
+        float_format = self._raw_readback is not None and '.' in self._raw_readback
+        await self._set_and_confirm(
+            lambda: set_max_utility_charge_current(
+                self._inverter_device.device_data, amps, float_format=float_format
+            ),
+            option,
+        )
 
 
 class InverterMaxChargingCurrentSelect(SelectBase):
@@ -289,23 +359,22 @@ class InverterMaxChargingCurrentSelect(SelectBase):
         super().__init__(inverter_device, coordinator)
         self._attr_unique_id = f"{self._inverter_device.inverter_id}_max_charging_current"
         self._attr_name = f"{self._inverter_device.name} Max Charging Current"
-        self._attr_options = ['2', '10', '20', '30', '40', '50', '60', '70', '80', '90', '100', '110', '120']
+        self._attr_options = ['10', '20', '30', '40', '50', '60', '70', '80']
 
         if coordinator.data is not None:
             data = coordinator.data.get(self._inverter_device.inverter_id) or {}
             self._attr_current_option = _normalize_amps(resolve_max_charging_current(data))
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        self._attr_current_option = _normalize_amps(resolve_max_charging_current(self.data))
-        self.async_write_ha_state()
+    def _read_current(self, data) -> str | None:
+        return _normalize_amps(resolve_max_charging_current(data))
 
     async def async_select_option(self, option: str):
-        if option in self._attr_options:
-            amps = int(option)
-            queue = self.hass.data["dess_monitor_local_queue"]
-            await queue.enqueue(
-                lambda: set_max_combined_charge_current(self._inverter_device.device_data, amps)
-            )
-            self._attr_current_option = option
-        await self.coordinator.async_request_refresh()
+        if option not in self._attr_options:
+            return
+        amps = int(option)
+        await self._set_and_confirm(
+            lambda: set_max_combined_charge_current(
+                self._inverter_device.device_data, amps
+            ),
+            option,
+        )

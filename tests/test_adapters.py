@@ -92,7 +92,7 @@ class TestBaseSemanticCommands:
     async def test_max_combined_charge_current(self):
         a = _RecordingAdapter()
         await a.set_max_combined_charge_current(50)
-        assert a.sent == "MCHGC050"
+        assert a.sent == "MNCHGC050"
 
     @pytest.mark.asyncio
     async def test_battery_charge_current(self):
