@@ -11,6 +11,7 @@ from custom_components.dess_monitor_local.api.commands.direct_commands import (
     ChargeSourcePrioritySetting,
     OutputSourcePrioritySetting,
     set_charge_source_priority,
+    set_max_combined_charge_current,
     set_max_utility_charge_current,
     set_output_source_priority,
 )
@@ -43,6 +44,7 @@ async def async_setup_entry(
         new_devices.append(InverterOutputPrioritySelect(item, coordinator))
         new_devices.append(InverterChargeSourcePrioritySelect(item, coordinator))
         new_devices.append(InverterMaxUtilityChargingCurrentNumber(item, coordinator))
+        new_devices.append(InverterMaxChargingCurrentSelect(item, coordinator))
         new_devices.append(BatteryModeSelect(item))
 
     if new_devices:
@@ -151,6 +153,10 @@ def resolve_chrage_source_priority(device_data):
 
 def resolve_max_utility_charging_current(device_data):
     return (device_data.get('qpiri') or {}).get('max_utility_charging_current')
+
+
+def resolve_max_charging_current(device_data):
+    return (device_data.get('qpiri') or {}).get('max_charging_current')
 
 
 class InverterOutputPrioritySelect(SelectBase):
@@ -273,6 +279,33 @@ class InverterMaxUtilityChargingCurrentNumber(SelectBase):
                 lambda: set_max_utility_charge_current(
                     self._inverter_device.device_data, amps, float_format=float_format
                 )
+            )
+            self._attr_current_option = option
+        await self.coordinator.async_request_refresh()
+
+
+class InverterMaxChargingCurrentSelect(SelectBase):
+    def __init__(self, inverter_device: InverterDevice, coordinator: DirectCoordinator):
+        super().__init__(inverter_device, coordinator)
+        self._attr_unique_id = f"{self._inverter_device.inverter_id}_max_charging_current"
+        self._attr_name = f"{self._inverter_device.name} Max Charging Current"
+        self._attr_options = ['2', '10', '20', '30', '40', '50', '60', '70', '80', '90', '100', '110', '120']
+
+        if coordinator.data is not None:
+            data = coordinator.data.get(self._inverter_device.inverter_id) or {}
+            self._attr_current_option = _normalize_amps(resolve_max_charging_current(data))
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._attr_current_option = _normalize_amps(resolve_max_charging_current(self.data))
+        self.async_write_ha_state()
+
+    async def async_select_option(self, option: str):
+        if option in self._attr_options:
+            amps = int(option)
+            queue = self.hass.data["dess_monitor_local_queue"]
+            await queue.enqueue(
+                lambda: set_max_combined_charge_current(self._inverter_device.device_data, amps)
             )
             self._attr_current_option = option
         await self.coordinator.async_request_refresh()
