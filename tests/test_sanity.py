@@ -7,11 +7,11 @@ from custom_components.dess_monitor_local import sanity
 
 
 class TestBatteryCurrent:
-    @pytest.mark.parametrize("v", [0.0, 1.0, 50.0, 500.0])
+    @pytest.mark.parametrize("v", [0.0, 1.0, 50.0, 300.0])
     def test_plausible(self, v):
         assert sanity.is_plausible_battery_current(v) is True
 
-    @pytest.mark.parametrize("v", [-0.1, 500.1, 10_010_110.0, 99999.0])
+    @pytest.mark.parametrize("v", [-0.1, 300.1, 447.0, 500.1, 10_010_110.0, 99999.0])
     def test_implausible(self, v):
         assert sanity.is_plausible_battery_current(v) is False
 
@@ -44,6 +44,35 @@ class TestPower:
     def test_negative_power_allowed(self):
         # Discharge is negative power and must be accepted.
         assert sanity.is_plausible_power(-341.0) is True
+
+
+class TestPlausibleQpigs:
+    def test_good_frame(self):
+        assert sanity.is_plausible_qpigs({
+            "battery_voltage": "26.5",
+            "battery_charging_current": "10",
+            "battery_discharge_current": "0",
+        }) is True
+
+    def test_rejects_emi_current_spike(self):
+        assert sanity.is_plausible_qpigs({
+            "battery_voltage": "26.5",
+            "battery_charging_current": "447",
+            "battery_discharge_current": "0",
+        }) is False
+
+    def test_rejects_emi_voltage_spike(self):
+        assert sanity.is_plausible_qpigs({
+            "battery_voltage": "741",
+            "battery_charging_current": "0",
+            "battery_discharge_current": "0",
+        }) is False
+
+    def test_rejects_error_dict(self):
+        assert sanity.is_plausible_qpigs({"error": "NAK"}) is False
+
+    def test_allows_missing_optional_fields(self):
+        assert sanity.is_plausible_qpigs({"battery_voltage": "48.0"}) is True
 
 
 class TestMaxStepWh:

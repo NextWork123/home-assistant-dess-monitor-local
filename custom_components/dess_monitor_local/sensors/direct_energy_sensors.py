@@ -752,6 +752,21 @@ class DirectBatteryStateOfChargeSensor(RestoreSensor, DirectTypedSensorBase):
             # net direction is what we want.
             signed_current_a = charging_current - discharging_current
 
+            if (
+                not is_plausible_battery_voltage(current_voltage)
+                or not is_plausible_battery_current(charging_current)
+                or not is_plausible_battery_current(discharging_current)
+            ):
+                _LOGGER.debug(
+                    "%s: skipping vSoC update on implausible QPIGS "
+                    "(V=%.2f I_chg=%.2f I_dis=%.2f)",
+                    self._attr_name,
+                    current_voltage,
+                    charging_current,
+                    discharging_current,
+                )
+                return
+
             self.update_soc(signed_current_a, current_voltage)
         except (KeyError, ValueError, TypeError):
             self._attr_native_value = None

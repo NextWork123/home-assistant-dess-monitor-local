@@ -20,9 +20,10 @@ MIN_BATTERY_VOLTAGE_V = 10.0
 MAX_BATTERY_VOLTAGE_V = 120.0
 
 # Continuous battery current for residential-class systems tops out around
-# 200 A combined (e.g., 5 kW @ 24 V). Allow 2.5× headroom for short
-# transient surges that the inverter may legitimately report.
-MAX_BATTERY_CURRENT_A = 500.0
+# 200 A combined (e.g., 5 kW @ 24 V). Allow headroom for short surges on
+# larger banks while still rejecting EMI artifacts in the 400–500 A class
+# that previously poisoned charts after CRC-passing corruption.
+MAX_BATTERY_CURRENT_A = 300.0
 
 # Hardware ceiling on instantaneous power for any inverter family this
 # integration speaks to. Largest single-phase Voltronic Axpert in this
@@ -42,6 +43,34 @@ def is_plausible_battery_voltage(value: float) -> bool:
 
 def is_plausible_power(value: float) -> bool:
     return -MAX_PLAUSIBLE_POWER_W <= value <= MAX_PLAUSIBLE_POWER_W
+
+
+def _float_field(data: dict, key: str) -> float | None:
+    raw = data.get(key)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_plausible_qpigs(data: dict) -> bool:
+    """True when QPIGS battery V/I fields are physically possible.
+
+    Missing fields are tolerated (some firmwares omit discharge current);
+    present values must pass the same bounds used by energy sensors.
+    """
+    if not isinstance(data, dict) or "error" in data:
+        return False
+    voltage = _float_field(data, "battery_voltage")
+    if voltage is not None and not is_plausible_battery_voltage(voltage):
+        return False
+    for key in ("battery_charging_current", "battery_discharge_current"):
+        current = _float_field(data, key)
+        if current is not None and not is_plausible_battery_current(current):
+            return False
+    return True
 
 
 def max_step_wh(elapsed_seconds: float) -> float:

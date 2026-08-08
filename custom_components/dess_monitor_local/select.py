@@ -11,6 +11,10 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from custom_components.dess_monitor_local import HubConfigEntry
+from custom_components.dess_monitor_local.api.commands.direct_command_queue import (
+    PRIORITY_USER,
+    run_on_bus,
+)
 from custom_components.dess_monitor_local.api.commands.direct_commands import (
     ChargeSourcePrioritySetting,
     OutputSourcePrioritySetting,
@@ -19,7 +23,11 @@ from custom_components.dess_monitor_local.api.commands.direct_commands import (
     set_max_utility_charge_current,
     set_output_source_priority,
 )
-from custom_components.dess_monitor_local.const import DOMAIN
+from custom_components.dess_monitor_local.const import (
+    CONF_BUS_MODE,
+    DEFAULT_BUS_MODE,
+    DOMAIN,
+)
 from custom_components.dess_monitor_local.coordinators.direct_coordinator import DirectCoordinator
 from custom_components.dess_monitor_local.hub import InverterDevice
 
@@ -198,10 +206,21 @@ class SelectBase(CoordinatorEntity, SelectEntity):
         self._pending_since = time.monotonic()
         self._attr_current_option = option
         self.async_write_ha_state()
-        queue = self.hass.data["dess_monitor_local_queue"]
+        entry = self.coordinator.config_entry
+        bus_mode = entry.options.get(CONF_BUS_MODE, DEFAULT_BUS_MODE)
+        uri = self._inverter_device.device_data
         acked = False
         for _ in range(3):
-            if self._is_ack(await queue.enqueue(send_fn)):
+            result = await run_on_bus(
+                self.hass,
+                entry.entry_id,
+                uri,
+                send_fn,
+                priority=PRIORITY_USER,
+                bus_mode=bus_mode,
+                desc="set",
+            )
+            if self._is_ack(result):
                 acked = True
                 break
             await asyncio.sleep(0.5)

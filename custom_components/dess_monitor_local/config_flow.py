@@ -20,7 +20,9 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    BUS_MODES,
     CONF_AGENT_DEVICE_ID,
+    CONF_BUS_MODE,
     CONF_DEBUG_PANEL,
     CONF_DEVICE,
     CONF_ENTRY_KIND,
@@ -39,6 +41,7 @@ from .const import (
     CONF_TRANSPORT,
     CONF_UPDATE_INTERVAL,
     DEFAULT_AGENT_PORT,
+    DEFAULT_BUS_MODE,
     DEFAULT_DEBUG_PANEL,
     DEFAULT_EYBOND_ANNOUNCE_IP,
     DEFAULT_EYBOND_BIND_HOST,
@@ -395,6 +398,24 @@ async def _build_connection_schema(
             )
         ] = BooleanSelector()
 
+    # Bus mode only matters for TCP bridges (Elfin / plain TCP / Modbus TCP).
+    # Serial and EyBond stay serialized regardless of this option.
+    if transport in (TRANSPORT_TCP_ELFIN, TRANSPORT_TCP):
+        schema[
+            vol.Optional(
+                CONF_BUS_MODE,
+                default=defaults.get(CONF_BUS_MODE, DEFAULT_BUS_MODE),
+            )
+        ] = SelectSelector(
+            SelectSelectorConfig(
+                options=[
+                    SelectOptionDict(value=mode, label=mode) for mode in BUS_MODES
+                ],
+                mode=SelectSelectorMode.LIST,
+                translation_key=CONF_BUS_MODE,
+            )
+        )
+
     return vol.Schema(schema)
 
 
@@ -625,6 +646,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 strict_crc = bool(
                     user_input.get(CONF_STRICT_CRC, DEFAULT_STRICT_CRC)
                 )
+                bus_mode = user_input.get(CONF_BUS_MODE, DEFAULT_BUS_MODE)
+                if bus_mode not in BUS_MODES:
+                    bus_mode = DEFAULT_BUS_MODE
 
                 device_value = _build_device_uri(
                     protocol, transport, host, port, serial_device, agent_device_id,
@@ -647,6 +671,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_EYBOND_ANNOUNCE_IP: eybond_announce_ip,
                         CONF_UPDATE_INTERVAL: update_interval,
                         CONF_STRICT_CRC: strict_crc,
+                        CONF_BUS_MODE: bus_mode,
                     },
                 )
 
@@ -712,6 +737,7 @@ class OptionsFlow(config_entries.OptionsFlow):
                 CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
             ),
             CONF_STRICT_CRC: opts.get(CONF_STRICT_CRC, DEFAULT_STRICT_CRC),
+            CONF_BUS_MODE: opts.get(CONF_BUS_MODE, DEFAULT_BUS_MODE),
         }
         self._protocol, self._transport = _normalize_protocol_transport(
             opts.get(CONF_PROTOCOL, parsed[CONF_PROTOCOL]),
@@ -806,6 +832,9 @@ class OptionsFlow(config_entries.OptionsFlow):
                 strict_crc = bool(
                     user_input.get(CONF_STRICT_CRC, DEFAULT_STRICT_CRC)
                 )
+                bus_mode = user_input.get(CONF_BUS_MODE, DEFAULT_BUS_MODE)
+                if bus_mode not in BUS_MODES:
+                    bus_mode = DEFAULT_BUS_MODE
 
                 device_value = _build_device_uri(
                     protocol, transport, host, port, serial_device, agent_device_id,
@@ -827,6 +856,7 @@ class OptionsFlow(config_entries.OptionsFlow):
                         CONF_EYBOND_ANNOUNCE_IP: eybond_announce_ip,
                         CONF_UPDATE_INTERVAL: update_interval,
                         CONF_STRICT_CRC: strict_crc,
+                        CONF_BUS_MODE: bus_mode,
                         CONF_DEBUG_PANEL: bool(
                             user_input.get(CONF_DEBUG_PANEL, DEFAULT_DEBUG_PANEL)
                         ),

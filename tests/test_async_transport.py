@@ -8,10 +8,21 @@ import asyncio
 import pytest
 
 from custom_components.dess_monitor_local.api.commands.direct_command_queue import (
+    PRIORITY_POLL,
+    PRIORITY_USER,
     CommandQueue,
+    QueueRegistry,
+    is_tcp_transport,
+    run_on_bus,
+    transport_key,
 )
 from custom_components.dess_monitor_local.api.crc import crc16_modbus
 from custom_components.dess_monitor_local.api.protocols import modbus_rtu
+from custom_components.dess_monitor_local.const import (
+    BUS_MODE_CONCURRENT_WRITES,
+    BUS_MODE_SERIALIZED,
+    DOMAIN,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +98,168 @@ class TestCommandQueue:
             return True
 
         assert asyncio.run(scenario()) is True
+
+
+    def test_user_priority_beats_queued_poll(self):
+        async def scenario():
+            q = CommandQueue(min_delay=0.0)
+            await q.start()
+            order = []
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def slow_poll():
+                started.set()
+                await release.wait()
+                order.append("poll")
+                return "poll"
+
+            async def user_cmd():
+                order.append("user")
+                return "user"
+
+            poll1 = asyncio.create_task(
+                q.enqueue(slow_poll, priority=PRIORITY_POLL)
+            )
+            await started.wait()
+            poll2 = asyncio.create_task(
+                q.enqueue(lambda: _const("poll2"), priority=PRIORITY_POLL)
+            )
+            user = asyncio.create_task(
+                q.enqueue(user_cmd, priority=PRIORITY_USER)
+            )
+            await asyncio.sleep(0.01)
+            release.set()
+            results = await asyncio.gather(poll1, poll2, user)
+            await q.stop()
+            return order, results
+
+        order, results = asyncio.run(scenario())
+        assert order == ["poll", "user"]
+        assert results[0] == "poll"
+        assert "user" in results
+        assert "poll2" in results
+
+
+class TestTransportKey:
+    def test_tcp_host_port(self):
+        assert transport_key("tcp://192.168.1.5:8899") == "tcp:192.168.1.5:8899"
+
+    def test_bare_serial(self):
+        assert transport_key("/dev/ttyUSB0") == "serial:/dev/ttyUSB0"
+
+    def test_is_tcp_transport(self):
+        assert is_tcp_transport("tcp://1.2.3.4:8899") is True
+        assert is_tcp_transport("/dev/ttyUSB0") is False
+
+
+class TestQueueRegistry:
+    def test_per_key_isolation(self):
+        async def scenario():
+            reg = QueueRegistry(min_delay=0.0)
+            order = []
+
+            async def a():
+                order.append("a")
+                await asyncio.sleep(0.05)
+                return "a"
+
+            async def b():
+                order.append("b")
+                return "b"
+
+            ra, rb = await asyncio.gather(
+                reg.enqueue("e1", "tcp://1.1.1.1:8899", a),
+                reg.enqueue("e1", "tcp://2.2.2.2:8899", b),
+            )
+            await reg.release_entry("e1")
+            return order, ra, rb
+
+        order, ra, rb = asyncio.run(scenario())
+        assert ra == "a" and rb == "b"
+        assert "a" in order and "b" in order
+
+    def test_release_stops_unused_queue(self):
+        async def scenario():
+            reg = QueueRegistry(min_delay=0.0)
+            await reg.enqueue("e1", "tcp://1.1.1.1:8899", lambda: _const(1))
+            key = transport_key("tcp://1.1.1.1:8899")
+            assert key in reg._queues
+            await reg.release_entry("e1")
+            return key not in reg._queues
+
+        assert asyncio.run(scenario()) is True
+
+    def test_shared_key_survives_partial_release(self):
+        async def scenario():
+            reg = QueueRegistry(min_delay=0.0)
+            uri = "tcp://1.1.1.1:8899"
+            await reg.enqueue("e1", uri, lambda: _const(1))
+            await reg.enqueue("e2", uri, lambda: _const(2))
+            await reg.release_entry("e1")
+            key = transport_key(uri)
+            still = key in reg._queues
+            await reg.release_entry("e2")
+            gone = key not in reg._queues
+            return still, gone
+
+        still, gone = asyncio.run(scenario())
+        assert still is True
+        assert gone is True
+
+
+class TestRunOnBus:
+    def test_concurrent_writes_bypasses_queue_for_user_tcp(self):
+        async def scenario():
+            class _Hass:
+                def __init__(self):
+                    self.data = {}
+
+            hass = _Hass()
+            called = {"n": 0}
+
+            async def fn():
+                called["n"] += 1
+                return "ok"
+
+            out = await run_on_bus(
+                hass,
+                "entry",
+                "tcp://1.2.3.4:8899",
+                fn,
+                priority=PRIORITY_USER,
+                bus_mode=BUS_MODE_CONCURRENT_WRITES,
+            )
+            registry = hass.data.get(DOMAIN, {}).get("queue_registry")
+            return out, called["n"], registry is None or not registry._queues
+
+        out, n, empty = asyncio.run(scenario())
+        assert out == "ok" and n == 1 and empty is True
+
+    def test_serialized_user_uses_queue(self):
+        async def scenario():
+            class _Hass:
+                def __init__(self):
+                    self.data = {}
+
+            hass = _Hass()
+
+            async def fn():
+                return 7
+
+            out = await run_on_bus(
+                hass,
+                "entry",
+                "tcp://1.2.3.4:8899",
+                fn,
+                priority=PRIORITY_USER,
+                bus_mode=BUS_MODE_SERIALIZED,
+            )
+            registry = hass.data[DOMAIN]["queue_registry"]
+            await registry.release_entry("entry")
+            return out
+
+        assert asyncio.run(scenario()) == 7
 
 
 async def _const(v):

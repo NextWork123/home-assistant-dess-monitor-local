@@ -16,13 +16,19 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from custom_components.dess_monitor_local import HubConfigEntry
+from custom_components.dess_monitor_local.api.commands.direct_command_queue import (
+    PRIORITY_USER,
+    run_on_bus,
+)
 from custom_components.dess_monitor_local.api.protocols.modbus_rtu import (
     parse_modbus_uri,
     write_modbus_single_register,
 )
 from custom_components.dess_monitor_local.const import (
+    CONF_BUS_MODE,
     CONF_DEVICE,
     CONF_PROTOCOL,
+    DEFAULT_BUS_MODE,
     DOMAIN,
     PROTOCOL_MODBUS,
 )
@@ -57,7 +63,7 @@ async def async_setup_entry(
         device_uri = getattr(item, "device_data", None) or entry_device_uri
         if not device_uri:
             continue
-        new_entities.append(SMG2ExitFaultButton(item, hass, device_uri))
+        new_entities.append(SMG2ExitFaultButton(item, hass, device_uri, config_entry))
 
     if new_entities:
         async_add_entities(new_entities)
@@ -75,10 +81,12 @@ class SMG2ExitFaultButton(ButtonEntity):
         inverter_device: InverterDevice,
         hass: HomeAssistant,
         device_uri: str,
+        config_entry: HubConfigEntry,
     ):
         self._inverter_device = inverter_device
         self._hass = hass
         self._device_uri = device_uri
+        self._config_entry = config_entry
         self._attr_unique_id = (
             f"{inverter_device.inverter_id}_exit_fault_state"
         )
@@ -92,8 +100,8 @@ class SMG2ExitFaultButton(ButtonEntity):
         )
 
     async def async_press(self) -> None:
-        """Issue the Modbus write. Goes through the shared command queue
-        so it can't interleave with the coordinator's polling reads —
+        """Issue the Modbus write. Goes through the per-transport command
+        queue so it can't interleave with the coordinator's polling reads —
         SMG-II's RS485 bus is half-duplex and overlapping transactions
         truncate each other's frames."""
         try:
@@ -102,17 +110,21 @@ class SMG2ExitFaultButton(ButtonEntity):
             _LOGGER.warning("Cannot parse Modbus URI %r: %s", self._device_uri, err)
             return
 
-        queue = self._hass.data.get("dess_monitor_local_queue")
-        if queue is None:
-            _LOGGER.warning("Command queue not available; skipping exit-fault")
-            return
-
         async def _do_write() -> dict:
             return await write_modbus_single_register(
                 host, port, _EXIT_FAULT_REGISTER, 1
             )
 
-        result = await queue.enqueue(_do_write)
+        bus_mode = self._config_entry.options.get(CONF_BUS_MODE, DEFAULT_BUS_MODE)
+        result = await run_on_bus(
+            self._hass,
+            self._config_entry.entry_id,
+            self._device_uri,
+            _do_write,
+            priority=PRIORITY_USER,
+            bus_mode=bus_mode,
+            desc="exit-fault",
+        )
         if isinstance(result, dict) and result.get("error"):
             _LOGGER.warning(
                 "Exit-fault write failed: %s", result["error"]

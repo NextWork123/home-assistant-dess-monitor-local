@@ -75,9 +75,22 @@ Match the bridge's serial settings to the inverter's interface:
   `9600` for Modbus RTU devices like SMG-II.
 - **Data bits / parity / stop bits** — `8 / None / 1` (typical default).
 - **Flow control** — `None`.
+- **Max Accept** — `2` or higher if you enable **Concurrent writes** bus
+  mode (see below). Stay at `1` with the default serialized mode.
 
 If you don't see any data and the connection just hangs, the baud rate is
 the first thing to double-check.
+
+#### Bus access mode (TCP / Elfin)
+
+Controls how polling and user commands share the TCP bridge:
+
+| Mode | Behavior |
+| --- | --- |
+| **Serialized** (default) | Polls and set commands share a per-device priority queue. User commands jump ahead of queued polls after the in-flight request finishes. Safest for Elfin bridges. |
+| **Concurrent writes** | Background polls stay on the queue; user set/confirm commands open a **second** TCP session immediately (v1.0-style). Faster mode/current changes, but requires Elfin **Max Accept ≥ 2**. Some bridges interleave bytes across sessions under load — if charts show EMI spikes after enabling this, switch back to Serialized. |
+
+Serial transports always stay serialized regardless of this option.
 
 ### Voltronic over EyBond (`voltronic` + `eybond`)
 
@@ -141,6 +154,17 @@ How often Home Assistant polls the device, in seconds.
 - Lower values mean fresher sensor data but more load on the link and the
   inverter. For slow links (Wi-Fi bridges, 2400-baud serial) keep this at
   `10` or higher.
+
+### Bus access mode
+
+For TCP / Elfin transports only (see [Bus access mode](#bus-access-mode-tcp--elfin)
+above). Default **Serialized**. Use **Concurrent writes** only when Elfin
+Max Accept ≥ 2 and you need faster set-command latency.
+
+### Strict CRC
+
+When enabled, Voltronic/PI18 frames with an invalid CRC are dropped instead
+of best-effort decoding. Useful on noisy RS232 / EMI-prone installs.
 
 ## Changing settings after install
 

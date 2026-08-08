@@ -16,6 +16,15 @@ CONF_EYBOND_BROADCAST = "eybond_broadcast"
 CONF_EYBOND_ANNOUNCE_IP = "eybond_announce_ip"
 CONF_UPDATE_INTERVAL = "update_interval"
 CONF_STRICT_CRC = "strict_crc"
+# How non-EyBond I/O shares the physical link. ``serialized`` (default) runs
+# all commands through a per-transport priority queue. ``concurrent_writes``
+# lets user set_/confirm open a separate TCP session while polls stay queued
+# (Elfin Max Accept >= 2); serial stays serialized either way.
+CONF_BUS_MODE = "bus_mode"
+BUS_MODE_SERIALIZED = "serialized"
+BUS_MODE_CONCURRENT_WRITES = "concurrent_writes"
+BUS_MODES = (BUS_MODE_SERIALIZED, BUS_MODE_CONCURRENT_WRITES)
+DEFAULT_BUS_MODE = BUS_MODE_SERIALIZED
 
 # Entry kind — distinguishes a single-inverter entry (legacy/default) from an
 # EyBond hub entry (one TCP listener, many auto-discovered dongles routed by

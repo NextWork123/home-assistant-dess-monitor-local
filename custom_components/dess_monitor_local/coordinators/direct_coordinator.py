@@ -10,13 +10,20 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from custom_components.dess_monitor_local import diag_hub
+from custom_components.dess_monitor_local.api.commands.direct_command_queue import (
+    PRIORITY_POLL,
+    PRIORITY_USER,
+    run_on_bus,
+)
 from custom_components.dess_monitor_local.api.dispatcher import get_direct_data
 from custom_components.dess_monitor_local.const import (
+    CONF_BUS_MODE,
     CONF_DEVICE,
     CONF_NAME,
     CONF_PROTOCOL,
     CONF_STRICT_CRC,
     CONF_UPDATE_INTERVAL,
+    DEFAULT_BUS_MODE,
     DEFAULT_STRICT_CRC,
     DEFAULT_UPDATE_INTERVAL,
     PROTOCOL_VOLTRONIC,
@@ -26,8 +33,34 @@ from custom_components.dess_monitor_local.coordinators.failure_tracker import (
     FailureOutcome,
     FailureTracker,
 )
+from custom_components.dess_monitor_local.sanity import is_plausible_qpigs
 
 _LOGGER = logging.getLogger(__name__)
+
+# Consecutive NAKs before a command is treated as unsupported for this
+# coordinator lifetime (avoids burning bus time on QPIGS2/QFWS forever,
+# without suppressing QPIGS after a single EMI glitch).
+_NAK_SUPPRESS_THRESHOLD = 2
+
+
+def _is_error_result(result) -> bool:
+    """True when a decode/transport outcome must not replace last-known data."""
+    if not result or not isinstance(result, dict):
+        return True
+    if "error" in result:
+        return True
+    if result.get("status") == "NAK":
+        return True
+    return False
+
+
+def _is_nak_result(result) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("status") == "NAK":
+        return True
+    err = result.get("error")
+    return isinstance(err, str) and "NAK" in err
 
 
 class DirectCoordinator(DataUpdateCoordinator):
@@ -98,10 +131,62 @@ class DirectCoordinator(DataUpdateCoordinator):
         self._targets = targets
         # Per-(target id, command) consecutive-failure counter + freeze policy.
         self._failures = FailureTracker(self._MAX_CONSECUTIVE_FAILURES)
+        # Commands that consistently NAK (e.g. QPIGS2 on single-MPPT units).
+        self._unsupported: set[tuple[str, str]] = set()
+        self._nak_counts: dict[tuple[str, str], int] = {}
         # Cycle counter driving the split poll cadence (see _CMD_SCHEDULE).
         self._cycle = 0
-        # self.my_api = my_api
-        # self._device: MyDevice | None = None
+
+    def _bus_mode(self) -> str:
+        return self.config_entry.options.get(CONF_BUS_MODE, DEFAULT_BUS_MODE)
+
+    def _is_unsupported(self, key: str, cmd: str) -> bool:
+        return (key, cmd) in self._unsupported
+
+    def _note_nak(self, key: str, cmd: str) -> bool:
+        """Count a NAK; return True once the command is marked unsupported."""
+        pair = (key, cmd)
+        if pair in self._unsupported:
+            return True
+        count = self._nak_counts.get(pair, 0) + 1
+        self._nak_counts[pair] = count
+        if count >= _NAK_SUPPRESS_THRESHOLD:
+            self._unsupported.add(pair)
+            _LOGGER.info(
+                "%s/%s NAK'd %d times; skipping for this session",
+                key, cmd, count,
+            )
+            return True
+        return False
+
+    def _clear_nak_streak(self, key: str, cmd: str) -> None:
+        self._nak_counts.pop((key, cmd), None)
+
+    def _accept_result(self, key: str, cmd: str, result: dict) -> dict | None:
+        """Classify a raw decode: return cleaned data, or None to retry/fail.
+
+        Error/NAK dicts must never call ``on_success`` or overwrite last-known
+        good sections (that was the main sensor-unknown regression path).
+        """
+        if _is_nak_result(result):
+            self._note_nak(key, cmd)
+            return None
+        if _is_error_result(result):
+            return None
+        if cmd == "QPIGS" and not is_plausible_qpigs(result):
+            _LOGGER.warning(
+                "%s/%s: implausible QPIGS rejected "
+                "(chg=%s dis=%s V=%s)",
+                key,
+                cmd,
+                result.get("battery_charging_current"),
+                result.get("battery_discharge_current"),
+                result.get("battery_voltage"),
+            )
+            return None
+        self._clear_nak_streak(key, cmd)
+        self._failures.on_success(key, cmd)
+        return result
 
     async def _async_setup(self):
         """Set up the coordinator
@@ -174,21 +259,26 @@ class DirectCoordinator(DataUpdateCoordinator):
         strict_crc = bool(
             self.config_entry.options.get(CONF_STRICT_CRC, DEFAULT_STRICT_CRC)
         )
-        queue = self.hass.data["dess_monitor_local_queue"]
+        entry_id = self.config_entry.entry_id
+        bus_mode = self._bus_mode()
         try:
-            if uri.startswith("eybond"):
-                result = await get_direct_data(uri, cmd, 30, strict_crc=strict_crc)
-            else:
-                result = await queue.enqueue(
-                    lambda: get_direct_data(uri, cmd, 30, strict_crc=strict_crc)
-                )
+            result = await run_on_bus(
+                self.hass,
+                entry_id,
+                uri,
+                lambda: get_direct_data(uri, cmd, 30, strict_crc=strict_crc),
+                priority=PRIORITY_USER,
+                bus_mode=bus_mode,
+                desc=f"refresh {cmd}",
+            )
         except Exception:
             result = None
-        if not result:
+        accepted = self._accept_result(key, cmd, result) if result else None
+        if not accepted:
             return
         data = dict(self.data or {})
         dev = dict(data.get(key) or {})
-        dev[section] = result
+        dev[section] = accepted
         data[key] = dev
         self.async_set_updated_data(data)
 
@@ -197,7 +287,8 @@ class DirectCoordinator(DataUpdateCoordinator):
             self.config_entry.options.get(CONF_STRICT_CRC, DEFAULT_STRICT_CRC)
         )
         prev_data = self.data or {}
-        queue = self.hass.data["dess_monitor_local_queue"]
+        entry_id = self.config_entry.entry_id
+        bus_mode = self._bus_mode()
 
         async def fetch_with_retry(key: str, uri: str, cmd: str, section: str) -> dict:
             """Read a command with one fast retry, then apply the pure
@@ -206,39 +297,51 @@ class DirectCoordinator(DataUpdateCoordinator):
             ``key`` is the target's stable id (failure tracking + last-known
             lookup); ``uri`` is the transport address the command is sent to.
             """
-            # EyBond children are serialized per-dongle inside the manager
-            # (per-session send_lock), so routing them through the single
-            # global CommandQueue would serialize across dongles too — making
-            # the cycle the SUM of every child's command times and letting one
-            # cycling dongle stall the rest. Send those directly so the
-            # per-child gather actually polls the dongles in parallel. The
-            # legacy single-device path keeps the queue (one socket, rate-limit).
-            via_queue = not uri.startswith("eybond")
+            prev_section = (prev_data.get(key) or {}).get(section) or {}
+            if self._is_unsupported(key, cmd):
+                # Carry last non-error section (usually {}) without I/O.
+                return prev_section if "error" not in prev_section else {}
+
             for attempt in range(2):
                 try:
-                    if via_queue:
-                        result = await queue.enqueue(
-                            lambda d=uri, c=cmd: get_direct_data(
-                                d, c, 30, strict_crc=strict_crc
-                            )
-                        )
-                    else:
-                        result = await get_direct_data(
-                            uri, cmd, 30, strict_crc=strict_crc
-                        )
+                    # EyBond bypasses the registry inside run_on_bus so hub
+                    # children still poll in parallel (per-dongle send_lock).
+                    result = await run_on_bus(
+                        self.hass,
+                        entry_id,
+                        uri,
+                        lambda d=uri, c=cmd: get_direct_data(
+                            d, c, 30, strict_crc=strict_crc
+                        ),
+                        priority=PRIORITY_POLL,
+                        bus_mode=bus_mode,
+                        desc=f"poll {cmd}",
+                    )
                 except Exception as err:  # transport raised unexpectedly
                     _LOGGER.debug(
                         "%s/%s attempt %d raised %r", key, cmd, attempt + 1, err
                     )
                     result = None
-                if result:
-                    self._failures.on_success(key, cmd)
-                    return result
+                if result is not None:
+                    if _is_nak_result(result):
+                        # Unsupported / not implemented: do not burn the
+                        # failure budget; after threshold, skip this cmd.
+                        if self._note_nak(key, cmd):
+                            return (
+                                prev_section
+                                if "error" not in prev_section
+                                else {}
+                            )
+                        result = None
+                    else:
+                        accepted = self._accept_result(key, cmd, result)
+                        if accepted is not None:
+                            return accepted
                 if attempt == 0:
                     await asyncio.sleep(self._RETRY_DELAY_S)
 
             count = self._failures.on_failure(key, cmd)
-            last_known = (prev_data.get(key) or {}).get(section) or {}
+            last_known = prev_section if "error" not in prev_section else {}
             data, outcome = self._failures.resolve(count, last_known)
             if outcome is FailureOutcome.FREEZE:
                 _LOGGER.debug(
@@ -276,62 +379,6 @@ class DirectCoordinator(DataUpdateCoordinator):
                         else:
                             sections[section] = prev.get(section) or {}
                     return key, sections
-                    # return device, {
-                    #     "timestamp": datetime.now(),
-                    #     "qpigs": {
-                    #         "grid_voltage": "239.7",
-                    #         "grid_frequency": "50.0",
-                    #         "ac_output_voltage": "230.2",
-                    #         "ac_output_frequency": "50.0",
-                    #         "output_apparent_power": "0095",
-                    #         "output_active_power": "0095",
-                    #         "load_percent": "002",
-                    #         "bus_voltage": "399",
-                    #         "battery_voltage": "26.50",
-                    #         "battery_charging_current": "000",
-                    #         "battery_capacity": "068",
-                    #         "inverter_heat_sink_temperature": "0040",
-                    #         "pv_input_current": "0000",
-                    #         "pv_input_voltage": "000.0",
-                    #         "scc_battery_voltage": "00.00",
-                    #         "battery_discharge_current": "00003",
-                    #         "device_status_bits_b7_b0": "00010000",
-                    #         "battery_voltage_offset": "00",
-                    #         "eeprom_version": "00",
-                    #         "pv_charging_power": "00001",
-                    #         "device_status_bits_b10_b8": "010"
-                    #     },
-                    #     "qpigs2": {
-                    #         "error": "NAK response received. Command not accepted."
-                    #     },
-                    #     "qpiri": {
-                    #         "rated_grid_voltage": "230.0",
-                    #         "rated_input_current": "15.2",
-                    #         "rated_ac_output_voltage": "230.0",
-                    #         "rated_output_frequency": "50.0",
-                    #         "rated_output_current": "15.2",
-                    #         "rated_output_apparent_power": "3500",
-                    #         "rated_output_active_power": "3500",
-                    #         "rated_battery_voltage": "24.0",
-                    #         "low_battery_to_ac_bypass_voltage": "24.0",
-                    #         "shut_down_battery_voltage": "23.0",
-                    #         "bulk_charging_voltage": "29.2",
-                    #         "float_charging_voltage": "27.2",
-                    #         "battery_type": "UserDefined",
-                    #         "max_utility_charging_current": "30",
-                    #         "max_charging_current": "050",
-                    #         "ac_input_voltage_range": "UPS",
-                    #         "output_source_priority": "SBU",
-                    #         "charger_source_priority": "SolarFirst",
-                    #         "parallel_max_number": "6",
-                    #         "reserved_uu": "01",
-                    #         "reserved_v": "0",
-                    #         "parallel_mode": "Master",
-                    #         "high_battery_voltage_to_battery_mode": "26.0",
-                    #         "solar_work_condition_in_parallel": "0",
-                    #         "solar_max_charging_power_auto_adjust": "1_"
-                    #     }
-                    # }
 
                 # With multiple devices (hub children), bound each one so a
                 # single stuck dongle can't blow the 120s cycle and starve the
